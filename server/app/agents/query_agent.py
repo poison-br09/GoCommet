@@ -1,0 +1,139 @@
+import json
+
+from openai import AsyncOpenAI
+
+from app.core.config import settings
+from app.core.logger import get_logger
+
+log = get_logger(__name__)
+openai_client = AsyncOpenAI(api_key=settings.openai_api_key.get_secret_value())
+
+_SCHEMA = """\
+Table: graph_threads
+  thread_id  TEXT         — unique job ID (primary key)
+  updated_at TIMESTAMPTZ  — when the record was last written
+  state      JSONB        — full pipeline state
+
+JSONB fields inside `state`:
+  final_decision              TEXT   — "auto_approve" | "flag_for_review" | "draft_amendment" | null (null = still processing)
+  decision_reasoning_or_draft TEXT   — agent reasoning or draft amendment email text
+  extracted_data              JSONB  — document fields, each stored as {"value": ..., "confidence": ...}
+    extracted_data → consignee_name     → value  TEXT
+    extracted_data → port_of_loading    → value  TEXT
+    extracted_data → port_of_discharge  → value  TEXT
+    extracted_data → incoterms          → value  TEXT
+    extracted_data → hs_code            → value  TEXT
+    extracted_data → gross_weight       → value  TEXT
+    extracted_data → invoice_number     → value  TEXT
+    extracted_data → description_of_goods → value TEXT
+    extracted_data → global_confidence_score  FLOAT (access as (state->'extracted_data'->>'global_confidence_score')::float)
+  validation_results  JSONB ARRAY — each element: {"field_name": TEXT, "status": "match"|"mismatch"|"uncertain", "found_value": TEXT, "expected_value": TEXT}
+
+Common PostgreSQL JSONB patterns for this table:
+  -- top-level text field
+  state->>'final_decision'
+
+  -- nested text value inside extracted_data
+  state->'extracted_data'->'port_of_discharge'->>'value'
+
+  -- nested float (requires cast)
+  (state->'extracted_data'->>'global_confidence_score')::float
+
+  -- jobs that have any mismatched field
+  state->'validation_results' @> '[{"status":"mismatch"}]'::jsonb
+
+  -- jobs that have any uncertain field
+  state->'validation_results' @> '[{"status":"uncertain"}]'::jsonb
+
+  -- expand validation_results array into rows (for aggregating per-field stats)
+  jsonb_array_elements(state->'validation_results') AS v
+
+  -- completed jobs only (pipeline finished)
+  state->>'final_decision' IS NOT NULL
+
+  -- jobs processed today
+  updated_at >= CURRENT_DATE
+
+  -- jobs processed this week
+  updated_at >= NOW() - INTERVAL '7 days'\
+"""
+
+_SQL_SYSTEM = """\
+You are a PostgreSQL expert writing read-only queries for a trade document pipeline database. \
+Given a plain English question and the schema below, write exactly one SELECT statement \
+that answers it. Return ONLY the SQL — no explanation, no markdown fences, no comments.\
+"""
+
+_ANSWER_SYSTEM = """\
+You are a helpful assistant for a trade document processing pipeline. \
+Given a question, the SQL that was executed, and the query results, write a clear \
+1–3 sentence answer grounded strictly in the data. Do not invent facts not present \
+in the results. If there are no rows, say so plainly.\
+"""
+
+
+async def generate_sql(question: str) -> str:
+    user_prompt = f"""\
+Schema:
+{_SCHEMA}
+
+Question: {question}
+
+Rules:
+- Write one SELECT query only.
+- For aggregate queries (COUNT, SUM, AVG, MAX, MIN) do not add LIMIT.
+- For row-returning queries add LIMIT 50 unless the question implies a different limit.
+- Return ONLY the SQL, nothing else.\
+"""
+    log.info("query_agent  SQL_GEN  START  |  question=%r", question)
+    response = await openai_client.responses.create(
+        model="gpt-4o-mini",
+        input=[
+            {"role": "system", "content": _SQL_SYSTEM},
+            {"role": "user", "content": user_prompt},
+        ],
+        temperature=0.0,
+        max_output_tokens=400,
+    )
+    sql = response.output_text.strip()
+
+    # Strip markdown fences if the model wrapped the SQL anyway
+    if sql.startswith("```"):
+        lines = sql.splitlines()
+        sql = "\n".join(
+            line for line in lines
+            if not line.strip().startswith("```")
+        ).strip()
+
+    log.info("query_agent  SQL_GEN  DONE  |  sql=%s", sql)
+    return sql
+
+
+async def generate_answer(question: str, sql: str, rows: list[dict]) -> str:
+    results_text = (
+        json.dumps(rows, default=str, indent=2) if rows else "No rows returned."
+    )
+    user_prompt = f"""\
+Question: {question}
+
+SQL executed:
+{sql}
+
+Results ({len(rows)} row(s)):
+{results_text}
+
+Answer the question in 1–3 sentences based strictly on these results.\
+"""
+    log.info("query_agent  ANSWER_GEN  START  |  row_count=%d", len(rows))
+    response = await openai_client.responses.create(
+        model="gpt-4o-mini",
+        input=[
+            {"role": "system", "content": _ANSWER_SYSTEM},
+            {"role": "user", "content": user_prompt},
+        ],
+        temperature=0.0,
+        max_output_tokens=200,
+    )
+    answer = response.output_text.strip()
+    log.info("query_agent  ANSWER_GEN  DONE  |  answer=%r", answer)
+    return answer
