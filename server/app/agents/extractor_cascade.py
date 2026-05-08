@@ -1,8 +1,10 @@
+import asyncio
 import base64
 import mimetypes
 import re
 from pathlib import Path
 
+import httpx
 from mistralai.client import Mistral, models
 from openai import AsyncOpenAI
 
@@ -13,9 +15,36 @@ from app.schemas.extraction import ExtractionOutput
 log = get_logger(__name__)
 
 openai_client = AsyncOpenAI(api_key=settings.openai_api_key.get_secret_value())
-mistral_client = Mistral(api_key=settings.mistral_api_key.get_secret_value())
+mistral_client = Mistral(
+    api_key=settings.mistral_api_key.get_secret_value(),
+    timeout_ms=120_000,
+)
 
 _TABLE_REF = re.compile(r'\[([^\]]+\.md)\]\([^\)]+\)')
+_NETWORK_RETRY_DELAYS = (1.0, 2.0, 4.0)
+
+
+async def _with_network_retries(operation_name: str, awaitable_factory):
+    last_exc: Exception | None = None
+    for attempt, delay in enumerate((0.0, *_NETWORK_RETRY_DELAYS), start=1):
+        if delay:
+            await asyncio.sleep(delay)
+        try:
+            return await awaitable_factory()
+        except (httpx.ConnectError, httpx.ReadTimeout, httpx.ConnectTimeout) as exc:
+            last_exc = exc
+            log.warning(
+                "%s  NETWORK_RETRY  |  attempt=%d/%d  error=%s",
+                operation_name,
+                attempt,
+                len(_NETWORK_RETRY_DELAYS) + 1,
+                exc,
+            )
+
+    raise RuntimeError(
+        f"{operation_name} failed after retries. Check internet/DNS connectivity "
+        f"from the backend process and verify MISTRAL_API_KEY. Last error: {last_exc}"
+    ) from last_exc
 
 
 def _inline_tables(page_markdown: str, images: list) -> str:
@@ -56,20 +85,26 @@ async def run_mistral_ocr(raw_document_path: str) -> str:
         document_path.name, len(document_bytes), content_type,
     )
 
-    uploaded_file = await mistral_client.files.upload_async(
-        file=models.File(
-            file_name=document_path.name,
-            content=document_bytes,
-            content_type=content_type,
+    uploaded_file = await _with_network_retries(
+        "Mistral OCR upload",
+        lambda: mistral_client.files.upload_async(
+            file=models.File(
+                file_name=document_path.name,
+                content=document_bytes,
+                content_type=content_type,
+            ),
+            purpose="ocr",
         ),
-        purpose="ocr",
     )
     log.debug("Mistral OCR  FILE_ID  |  file_id=%s", uploaded_file.id)
 
-    ocr_response = await mistral_client.ocr.process_async(
-        model="mistral-ocr-latest",
-        document={"type": "file", "file_id": uploaded_file.id},
-        include_image_base64=True,  # required to retrieve embedded table content
+    ocr_response = await _with_network_retries(
+        "Mistral OCR process",
+        lambda: mistral_client.ocr.process_async(
+            model="mistral-ocr-latest",
+            document={"type": "file", "file_id": uploaded_file.id},
+            include_image_base64=True,  # required to retrieve embedded table content
+        ),
     )
 
     pages_markdown: list[str] = []

@@ -1,12 +1,11 @@
 import { useEffect, useRef, useState } from "react";
-import { getStatus, runQuery, submitDocument } from "./api";
-import type { QueryResponse } from "./api";
+import { createReviewQueueStream, getPendingReview, getStatus, resumePipeline, runQuery } from "./api";
 import type {
-  Decision,
   ExtractionOutput,
   FieldValidation,
   FieldValue,
   LineItem,
+  PendingReviewItem,
   PipelineResult,
 } from "./types";
 
@@ -77,7 +76,7 @@ function ExtractionPanel({ data }: { data: ExtractionOutput }) {
   return (
     <section className="card">
       <div className="card-header">
-        <h2>Extracted Fields</h2>
+        <h2>{data.document_name ? `Extracted Fields · ${data.document_name}` : "Extracted Fields"}</h2>
         <span className="sub">
           Global confidence&nbsp;
           <ConfidenceBadge value={data.global_confidence_score} />
@@ -137,7 +136,7 @@ function ExtractionPanel({ data }: { data: ExtractionOutput }) {
   );
 }
 
-// ── validation panel ──────────────────────────────────────────────────────────
+// ── validation styles ─────────────────────────────────────────────────────────
 
 const STATUS_STYLE: Record<FieldValidation["status"], React.CSSProperties> = {
   match:     { background: "#16a34a", color: "#fff" },
@@ -145,13 +144,42 @@ const STATUS_STYLE: Record<FieldValidation["status"], React.CSSProperties> = {
   uncertain: { background: "#d97706", color: "#fff" },
 };
 
-function ValidationPanel({ results }: { results: FieldValidation[] }) {
+function workflowStatusLabel(status: PipelineResult["status"] | null | undefined): string {
+  if (status === "processing") return "Incoming";
+  if (status === "pending_review") return "Review";
+  if (status === "failed") return "Failed";
+  if (status === "sent") return "Sent";
+  return "Complete";
+}
+
+function workflowStatusStyle(status: PipelineResult["status"] | null | undefined): React.CSSProperties {
+  if (status === "processing") return { background: "#2563eb", color: "#fff" };
+  if (status === "failed") return { background: "#dc2626", color: "#fff" };
+  if (status === "sent") return { background: "#16a34a", color: "#fff" };
+  return { background: "#d97706", color: "#fff" };
+}
+
+const CG_SELECTED_THREAD_KEY = "nova.cg.selectedThreadId";
+
+// ── CG workflow tab ───────────────────────────────────────────────────────────
+
+function ReviewValidationPanel({
+  results,
+  selected,
+  onSelect,
+}: {
+  results: FieldValidation[];
+  selected: FieldValidation | null;
+  onSelect: (item: FieldValidation) => void;
+}) {
   return (
     <section className="card">
-      <h2>Validation Results</h2>
+      <h2>Verification Results</h2>
       <table className="tbl">
         <thead>
           <tr>
+            <th>Document</th>
+            <th>Check</th>
             <th>Field</th>
             <th>Found</th>
             <th>Expected</th>
@@ -159,242 +187,275 @@ function ValidationPanel({ results }: { results: FieldValidation[] }) {
           </tr>
         </thead>
         <tbody>
-          {results.map((r) => (
-            <tr key={r.field_name}>
+          {results.map((r, index) => (
+            <tr
+              key={`${r.validation_type}-${r.document_name}-${r.field_name}-${index}`}
+              className="clickable-row"
+              onClick={() => onSelect(r)}
+            >
+              <td>{r.document_name ?? "—"}</td>
+              <td>{r.validation_type === "cross_document" ? "Cross-doc" : "Customer rules"}</td>
               <td className="td-name">{fmt(r.field_name)}</td>
               <td>{r.found_value ?? <span className="nil">—</span>}</td>
               <td>{r.expected_value ?? <span className="nil">—</span>}</td>
               <td>
-                <Badge
-                  label={r.status.replace("_", " ")}
-                  style={STATUS_STYLE[r.status]}
-                />
+                <Badge label={r.status} style={STATUS_STYLE[r.status]} />
               </td>
             </tr>
           ))}
         </tbody>
       </table>
-    </section>
-  );
-}
 
-// ── decision panel ────────────────────────────────────────────────────────────
-
-const DECISION_STYLE: Record<Decision, React.CSSProperties> = {
-  auto_approve:    { background: "#16a34a", color: "#fff" },
-  flag_for_review: { background: "#d97706", color: "#fff" },
-  draft_amendment: { background: "#dc2626", color: "#fff" },
-};
-
-const DECISION_LABEL: Record<Decision, string> = {
-  auto_approve:    "Auto Approved",
-  flag_for_review: "Flagged for Review",
-  draft_amendment: "Amendment Required",
-};
-
-function DecisionPanel({ decision, text }: { decision: Decision; text: string | null }) {
-  return (
-    <section className="card">
-      <h2>Decision</h2>
-      <Badge label={DECISION_LABEL[decision]} style={DECISION_STYLE[decision]} large />
-
-      {text && (
-        <div className="reasoning">
-          {decision === "draft_amendment" ? (
-            <>
-              <h3>Draft Amendment Email</h3>
-              <pre className="draft-email">{text}</pre>
-            </>
-          ) : (
-            <>
-              <h3>Reasoning</h3>
-              <p>{text}</p>
-            </>
-          )}
+      {selected && (
+        <div className="detail-box">
+          <div className="detail-head">
+            <strong>{fmt(selected.field_name)}</strong>
+            <Badge label={selected.status} style={STATUS_STYLE[selected.status]} />
+          </div>
+          <p><span className="td-name">Document:</span> {selected.document_name ?? "—"}</p>
+          <p><span className="td-name">Found:</span> {selected.found_value ?? "—"}</p>
+          <p><span className="td-name">Expected:</span> {selected.expected_value ?? "—"}</p>
+          <pre className="snippet">{selected.source_snippet ?? "No source snippet captured."}</pre>
         </div>
       )}
     </section>
   );
 }
 
-// ── pipeline tab ──────────────────────────────────────────────────────────────
-
-type PipelineView = "home" | "processing" | "results";
-
-function PipelineTab() {
-  const [view, setView] = useState<PipelineView>("home");
-  const [file, setFile] = useState<File | null>(null);
-  const [uploadError, setUploadError] = useState<string | null>(null);
-  const [lookupId, setLookupId] = useState("");
-  const [lookupError, setLookupError] = useState<string | null>(null);
-  const [lookupLoading, setLookupLoading] = useState(false);
-  const [elapsed, setElapsed] = useState(0);
+function CGWorkflowTab() {
+  const [queue, setQueue] = useState<PendingReviewItem[]>([]);
+  const [selectedThreadId, setSelectedThreadId] = useState<string | null>(null);
   const [result, setResult] = useState<PipelineResult | null>(null);
-  const pollRef = useRef<number | null>(null);
-  const timerRef = useRef<number | null>(null);
+  const [selectedValidation, setSelectedValidation] = useState<FieldValidation | null>(null);
+  const [draft, setDraft] = useState("");
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [sentMessage, setSentMessage] = useState<string | null>(null);
+  const [selectedHasUpdate, setSelectedHasUpdate] = useState(false);
+  const [draftDirty, setDraftDirty] = useState(false);
+  const selectedThreadRef = useRef<string | null>(null);
+  const resultStatusRef = useRef<PipelineResult["status"] | null>(null);
+  const draftDirtyRef = useRef(false);
 
-  function stopTimers() {
-    if (pollRef.current) clearInterval(pollRef.current);
-    if (timerRef.current) clearInterval(timerRef.current);
+  function applyResult(data: PipelineResult, options?: { preserveDirtyDraft?: boolean }) {
+    setResult(data);
+    resultStatusRef.current = data.status;
+    if (!options?.preserveDirtyDraft || !draftDirtyRef.current) {
+      setDraft(data.decision_reasoning_or_draft ?? "");
+      setDraftDirty(false);
+      draftDirtyRef.current = false;
+    }
+    setSelectedValidation(data.validation_results?.find((r) => r.status !== "match") ?? data.validation_results?.[0] ?? null);
   }
 
-  function goHome() {
-    stopTimers();
-    setView("home");
-    setResult(null);
-    setFile(null);
-    setUploadError(null);
-    setLookupId("");
-    setLookupError(null);
-    setElapsed(0);
+  async function loadQueue(): Promise<PendingReviewItem[]> {
+    setError(null);
+    try {
+      const rows = await getPendingReview();
+      setQueue(rows);
+      return rows;
+    } catch (e) {
+      setError(String(e));
+      return [];
+    }
   }
 
-  function startPolling(jobId: string) {
-    setElapsed(0);
-    timerRef.current = window.setInterval(() => setElapsed((s) => s + 1), 1000);
-    pollRef.current = window.setInterval(async () => {
+  async function openThread(threadId: string) {
+    setLoading(true);
+    setError(null);
+    setSentMessage(null);
+    try {
+      const data = await getStatus(threadId);
+      setSelectedThreadId(threadId);
+      selectedThreadRef.current = threadId;
+      setSelectedHasUpdate(false);
+      window.localStorage.setItem(CG_SELECTED_THREAD_KEY, threadId);
+      applyResult(data);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function approveAndSend() {
+    if (!selectedThreadId || !draft.trim()) return;
+    setLoading(true);
+    setError(null);
+    try {
+      const data = await resumePipeline(selectedThreadId, draft);
+      applyResult(data);
+      setSentMessage("Mock email sent and thread completed.");
+      await loadQueue();
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  useEffect(() => {
+    async function restoreQueue() {
+      await loadQueue();
+      const savedThreadId = window.localStorage.getItem(CG_SELECTED_THREAD_KEY);
+      if (savedThreadId) {
+        await openThread(savedThreadId);
+      }
+    }
+
+    restoreQueue();
+  }, []);
+
+  useEffect(() => {
+    const stream = createReviewQueueStream();
+
+    stream.addEventListener("queue", async (event) => {
       try {
-        const data = await getStatus(jobId);
-        if (data.status === "complete") {
-          stopTimers();
-          setResult(data);
-          setView("results");
+        const rows = JSON.parse((event as MessageEvent).data) as PendingReviewItem[];
+        setQueue(rows);
+        const selectedThreadId = selectedThreadRef.current;
+        if (!selectedThreadId) return;
+
+        const selectedQueueItem = rows.find((item) => item.thread_id === selectedThreadId);
+        if (selectedQueueItem?.status && selectedQueueItem.status !== resultStatusRef.current) {
+          setSelectedHasUpdate(true);
         }
       } catch (e) {
-        stopTimers();
-        setUploadError(String(e));
-        setView("home");
+        setError(String(e));
       }
-    }, 2000);
-  }
+    });
 
-  useEffect(() => () => stopTimers(), []);
+    stream.onerror = () => {
+      setError("Live queue connection interrupted. Use Refresh if the queue looks stale.");
+    };
 
-  async function handleUpload(e: React.FormEvent) {
-    e.preventDefault();
-    if (!file) return;
-    setUploadError(null);
-    setView("processing");
-    try {
-      const { job_id } = await submitDocument(file);
-      startPolling(job_id);
-    } catch (e) {
-      setUploadError(String(e));
-      setView("home");
-    }
-  }
+    return () => stream.close();
+  }, []);
 
-  async function handleLookup(e: React.FormEvent) {
-    e.preventDefault();
-    const id = lookupId.trim();
-    if (!id) return;
-    setLookupError(null);
-    setLookupLoading(true);
-    try {
-      const data = await getStatus(id);
-      setResult(data);
-      setView("results");
-    } catch (e) {
-      setLookupError(String(e));
-    } finally {
-      setLookupLoading(false);
-    }
-  }
+  const extractedDocs = Array.isArray(result?.extracted_data)
+    ? result.extracted_data
+    : result?.extracted_data
+      ? [result.extracted_data]
+      : [];
 
-  // ── home ──
-  if (view === "home") {
-    return (
-      <div className="home-grid">
-        <section className="card home-card">
-          <h2>Process New Document</h2>
-          <p className="sub">Bill of Lading · Commercial Invoice · Packing List — PDF, PNG, JPG</p>
-          <form onSubmit={handleUpload} style={{ marginTop: "1.25rem" }}>
-            <label className="file-label">
-              <input
-                type="file"
-                accept=".pdf,.png,.jpg,.jpeg,.xls,.xlsx"
-                onChange={(e) => setFile(e.target.files?.[0] ?? null)}
-              />
-              <span className="file-btn">Choose File</span>
-              <span className="file-name">{file ? file.name : "No file chosen"}</span>
-            </label>
-            <button type="submit" className="btn-primary btn-full" disabled={!file}>
-              Process Document
-            </button>
-          </form>
-          {uploadError && <p className="lookup-error">{uploadError}</p>}
-        </section>
-
-        <section className="card home-card">
-          <h2>Look Up by Job ID</h2>
-          <p className="sub">Retrieve results of any previous job instantly.</p>
-          <form onSubmit={handleLookup} style={{ marginTop: "1.25rem" }}>
-            <input
-              className="ask-input"
-              style={{ width: "100%", marginBottom: "0.75rem" }}
-              type="text"
-              placeholder="Paste job ID…"
-              value={lookupId}
-              onChange={(e) => { setLookupId(e.target.value); setLookupError(null); }}
-            />
-            <button
-              type="submit"
-              className="btn-primary btn-full"
-              disabled={!lookupId.trim() || lookupLoading}
-            >
-              {lookupLoading ? "Looking up…" : "Get Result"}
-            </button>
-          </form>
-          {lookupError && <p className="lookup-error">{lookupError}</p>}
-        </section>
-      </div>
-    );
-  }
-
-  // ── processing ──
-  if (view === "processing") {
-    return (
-      <div className="status-card">
-        <div className="spinner" />
-        <p>Running pipeline…</p>
-        <p className="sub">{elapsed}s elapsed</p>
-        <p className="sub">OCR → Extract → Validate → Route</p>
-      </div>
-    );
-  }
-
-  // ── results ──
   return (
-    <>
-      <div className="result-bar">
-        <button className="btn-link" onClick={goHome}>← Back</button>
-        <span className="mono">Job: {result?.job_id}</span>
-        <span
-          className="badge"
-          style={{ background: result?.status === "processing" ? "#d97706" : "#16a34a", color: "#fff" }}
-        >
-          {result?.status}
-        </span>
-      </div>
-
-      {result?.status === "processing" && (
-        <div className="status-card compact">
-          <div className="spinner" />
-          <p>This job is still running. Check back shortly.</p>
+    <div className="cg-grid">
+      <section className="card queue-card">
+        <div className="card-header">
+          <h2>CG Workflow Queue</h2>
+          <button className="btn-link" onClick={loadQueue}>Refresh</button>
         </div>
-      )}
+        {queue.length === 0 ? (
+          <p className="sub">No incoming or paused email threads are waiting for CG action.</p>
+        ) : (
+          <div className="queue-list">
+            {queue.map((item) => (
+              <button
+                key={item.thread_id}
+                className={item.thread_id === selectedThreadId ? "queue-item active" : "queue-item"}
+                onClick={() => openThread(item.thread_id)}
+              >
+                <span>{item.incoming_email?.subject ?? "Untitled shipment"}</span>
+                <Badge
+                  label={workflowStatusLabel(item.status)}
+                  style={workflowStatusStyle(item.status)}
+                />
+                <small>{item.incoming_email?.sender ?? "Unknown sender"}</small>
+                <small>{item.incoming_email?.attachment_paths.length ?? 0} attachment(s)</small>
+                <small>{item.thread_id}</small>
+              </button>
+            ))}
+          </div>
+        )}
+        {error && <p className="lookup-error">{error}</p>}
+      </section>
 
-      {result?.extracted_data && <ExtractionPanel data={result.extracted_data} />}
-      {result?.validation_results?.length ? (
-        <ValidationPanel results={result.validation_results} />
-      ) : null}
-      {result?.final_decision && (
-        <DecisionPanel
-          decision={result.final_decision}
-          text={result.decision_reasoning_or_draft}
-        />
-      )}
-    </>
+      <div className="review-pane">
+        {selectedHasUpdate && selectedThreadId && (
+          <section className="update-banner">
+            <span>This thread has new results.</span>
+            <button className="btn-link" onClick={() => openThread(selectedThreadId)}>
+              Load update
+            </button>
+          </section>
+        )}
+
+        {loading && (
+          <div className="inline-status">
+            <div className="spinner-sm" />
+            <span className="sub">Loading workflow state…</span>
+          </div>
+        )}
+
+        {!result && !loading && (
+          <section className="card">
+            <h2>CG Workflow</h2>
+            <p className="sub">Select an incoming or paused email thread to track processing, review discrepancies, and approve the draft reply.</p>
+          </section>
+        )}
+
+        {result && (
+          <>
+            <section className="card">
+              <div className="card-header">
+                <h2>{result.incoming_email?.subject ?? "Shipment Review"}</h2>
+                <Badge
+                  label={workflowStatusLabel(result.status)}
+                  style={workflowStatusStyle(result.status)}
+                />
+              </div>
+              <p className="sub">From {result.incoming_email?.sender ?? "—"}</p>
+              <p className="sub">{result.incoming_email?.attachment_paths.length ?? 0} attachment(s)</p>
+              {result.status === "processing" && (
+                <div className="inline-status">
+                  <div className="spinner-sm" />
+                  <span className="sub">New SU email received. Agent is extracting and validating attached documents.</span>
+                </div>
+              )}
+              {result.status === "failed" && (
+                <p className="lookup-error">{result.error_message ?? "The backend worker failed before completing this thread."}</p>
+              )}
+            </section>
+
+            {extractedDocs.map((doc, index) => (
+              <ExtractionPanel key={`${doc.path ?? index}`} data={doc} />
+            ))}
+
+            {result.validation_results?.length ? (
+              <ReviewValidationPanel
+                results={result.validation_results}
+                selected={selectedValidation}
+                onSelect={setSelectedValidation}
+              />
+            ) : null}
+
+            {result.status !== "processing" && result.status !== "failed" && (
+              <section className="card">
+                <h2>Draft Reply</h2>
+                <textarea
+                  className="draft-editor"
+                value={draft}
+                onChange={(e) => {
+                  setDraft(e.target.value);
+                  setDraftDirty(true);
+                  draftDirtyRef.current = true;
+                }}
+                disabled={result.status === "sent"}
+              />
+                <button
+                  className="btn-primary"
+                  onClick={approveAndSend}
+                  disabled={loading || result.status === "sent" || !draft.trim()}
+                >
+                  {result.status === "sent" ? "Sent" : "Approve & Send"}
+                </button>
+                {sentMessage && <p className="success-msg">{sentMessage}</p>}
+              </section>
+            )}
+          </>
+        )}
+      </div>
+    </div>
   );
 }
 
@@ -485,10 +546,10 @@ function QueryTab() {
 
 // ── app shell ─────────────────────────────────────────────────────────────────
 
-type Tab = "pipeline" | "query";
+type Tab = "cg" | "query";
 
 export default function App() {
-  const [tab, setTab] = useState<Tab>("pipeline");
+  const [tab, setTab] = useState<Tab>("cg");
 
   return (
     <div className="app">
@@ -496,10 +557,10 @@ export default function App() {
         <span className="logo">Nova Pipeline</span>
         <nav className="tab-nav">
           <button
-            className={tab === "pipeline" ? "tab active" : "tab"}
-            onClick={() => setTab("pipeline")}
+            className={tab === "cg" ? "tab active" : "tab"}
+            onClick={() => setTab("cg")}
           >
-            Process Document
+            CG Workflow
           </button>
           <button
             className={tab === "query" ? "tab active" : "tab"}
@@ -511,7 +572,8 @@ export default function App() {
       </header>
 
       <main className="main">
-        {tab === "pipeline" ? <PipelineTab /> : <QueryTab />}
+        {tab === "cg" && <CGWorkflowTab />}
+        {tab === "query" && <QueryTab />}
       </main>
     </div>
   );

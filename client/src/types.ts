@@ -16,6 +16,8 @@ export interface LineItem {
 }
 
 export interface ExtractionOutput {
+  document_name?: string;
+  path?: string;
   consignee_name: FieldValue;
   hs_code: FieldValue;
   port_of_loading: FieldValue;
@@ -33,6 +35,9 @@ export interface FieldValidation {
   status: "match" | "mismatch" | "uncertain";
   found_value: string | null;
   expected_value: string | null;
+  document_name?: string | null;
+  source_snippet?: string | null;
+  validation_type?: "cross_document" | "customer_rules" | string;
 }
 
 export type Decision =
@@ -42,9 +47,39 @@ export type Decision =
 
 export interface PipelineResult {
   job_id: string;
-  status: "processing" | "complete";
-  extracted_data: ExtractionOutput | null;
+  thread_id: string;
+  status: "processing" | "pending_review" | "sent" | "complete" | "failed";
+  incoming_email: {
+    sender: string;
+    subject: string;
+    attachment_paths: string[];
+  } | null;
+  extracted_data: ExtractionOutput[] | ExtractionOutput | null;
   validation_results: FieldValidation[] | null;
   final_decision: Decision | null;
   decision_reasoning_or_draft: string | null;
+  human_review_status: string | null;
+  edited_email_text: string | null;
+  mock_send_result: {
+    to: string;
+    subject: string;
+    body: string;
+    status: string;
+  } | null;
+  error_message: string | null;
+}
+
+export interface PendingReviewItem {
+  thread_id: string;
+  updated_at: string;
+  status: PipelineResult["status"] | null;
+  incoming_email: {
+    sender: string;
+    subject: string;
+    attachment_paths: string[];
+  } | null;
+  final_decision: Decision | string | null;
+  decision_reasoning_or_draft: string | null;
+  validation_results: FieldValidation[] | null;
+  error_message: string | null;
 }

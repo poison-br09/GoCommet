@@ -1,28 +1,10 @@
-import type { PipelineResult } from "./types";
+import type { PendingReviewItem, PipelineResult } from "./types";
 
 const BASE = `${import.meta.env.VITE_API_BASE_URL ?? ""}/api/v1`;
 const API_KEY = import.meta.env.VITE_API_KEY ?? "";
 
 function headers(extra?: Record<string, string>) {
   return { "x-api-key": API_KEY, ...extra };
-}
-
-export async function submitDocument(file: File): Promise<{ job_id: string }> {
-  const form = new FormData();
-  form.append("file", file);
-
-  const res = await fetch(`${BASE}/pipeline/process`, {
-    method: "POST",
-    headers: headers(),
-    body: form,
-  });
-
-  if (!res.ok) {
-    const err = await res.json().catch(() => ({ detail: res.statusText }));
-    throw new Error(err.detail ?? "Upload failed");
-  }
-
-  return res.json();
 }
 
 export async function getStatus(jobId: string): Promise<PipelineResult> {
@@ -33,6 +15,43 @@ export async function getStatus(jobId: string): Promise<PipelineResult> {
   if (!res.ok) {
     const err = await res.json().catch(() => ({ detail: res.statusText }));
     throw new Error(err.detail ?? "Status check failed");
+  }
+
+  return res.json();
+}
+
+export async function getPendingReview(): Promise<PendingReviewItem[]> {
+  const res = await fetch(`${BASE}/pipeline/review-queue`, {
+    headers: headers(),
+  });
+
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ detail: res.statusText }));
+    throw new Error(err.detail ?? "Review queue lookup failed");
+  }
+
+  return res.json();
+}
+
+export function createReviewQueueStream(): EventSource {
+  const url = new URL(`${BASE}/pipeline/review-queue/stream`, window.location.origin);
+  url.searchParams.set("api_key", API_KEY);
+  return new EventSource(url.toString());
+}
+
+export async function resumePipeline(
+  threadId: string,
+  editedEmailText: string,
+): Promise<PipelineResult> {
+  const res = await fetch(`${BASE}/pipeline/resume/${threadId}`, {
+    method: "POST",
+    headers: headers({ "Content-Type": "application/json" }),
+    body: JSON.stringify({ edited_email_text: editedEmailText }),
+  });
+
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ detail: res.statusText }));
+    throw new Error(err.detail ?? "Resume failed");
   }
 
   return res.json();

@@ -1,2 +1,12 @@
 node_modules
 .env
+.env.*
+!.env.example
+dist
+.vite
+coverage
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+.DS_Store

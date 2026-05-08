@@ -15,29 +15,32 @@ Table: graph_threads
   state      JSONB        — full pipeline state
 
 JSONB fields inside `state`:
+  incoming_email              JSONB  — sender, subject, attachment_paths
+  human_review_status         TEXT   — "processing" | "pending" | "approved" | "sent"
   final_decision              TEXT   — "auto_approve" | "flag_for_review" | "draft_amendment" | null (null = still processing)
-  decision_reasoning_or_draft TEXT   — agent reasoning or draft amendment email text
-  extracted_data              JSONB  — document fields, each stored as {"value": ..., "confidence": ...}
-    extracted_data → consignee_name     → value  TEXT
-    extracted_data → port_of_loading    → value  TEXT
-    extracted_data → port_of_discharge  → value  TEXT
-    extracted_data → incoterms          → value  TEXT
-    extracted_data → hs_code            → value  TEXT
-    extracted_data → gross_weight       → value  TEXT
-    extracted_data → invoice_number     → value  TEXT
-    extracted_data → description_of_goods → value TEXT
-    extracted_data → global_confidence_score  FLOAT (access as (state->'extracted_data'->>'global_confidence_score')::float)
-  validation_results  JSONB ARRAY — each element: {"field_name": TEXT, "status": "match"|"mismatch"|"uncertain", "found_value": TEXT, "expected_value": TEXT}
+  decision_reasoning_or_draft TEXT   — agent reasoning or draft approval/amendment email text
+  extracted_data              JSONB ARRAY — one object per attached document
+    each item has document_name, path, and field objects stored as {"value": ..., "confidence": ...}
+    item → consignee_name     → value  TEXT
+    item → port_of_loading    → value  TEXT
+    item → port_of_discharge  → value  TEXT
+    item → incoterms          → value  TEXT
+    item → hs_code            → value  TEXT
+    item → gross_weight       → value  TEXT
+    item → invoice_number     → value  TEXT
+    item → description_of_goods → value TEXT
+    item → global_confidence_score  FLOAT
+  validation_results  JSONB ARRAY — each element: {"field_name": TEXT, "status": "match"|"mismatch"|"uncertain", "found_value": TEXT, "expected_value": TEXT, "document_name": TEXT, "validation_type": TEXT}
 
 Common PostgreSQL JSONB patterns for this table:
   -- top-level text field
   state->>'final_decision'
 
   -- nested text value inside extracted_data
-  state->'extracted_data'->'port_of_discharge'->>'value'
+  (state->'extracted_data'->0->'port_of_discharge'->>'value')
 
   -- nested float (requires cast)
-  (state->'extracted_data'->>'global_confidence_score')::float
+  (state->'extracted_data'->0->>'global_confidence_score')::float
 
   -- jobs that have any mismatched field
   state->'validation_results' @> '[{"status":"mismatch"}]'::jsonb
@@ -49,7 +52,10 @@ Common PostgreSQL JSONB patterns for this table:
   jsonb_array_elements(state->'validation_results') AS v
 
   -- completed jobs only (pipeline finished)
-  state->>'final_decision' IS NOT NULL
+  state->>'human_review_status' = 'sent'
+
+  -- jobs waiting for CG approval
+  state->>'human_review_status' = 'pending'
 
   -- jobs processed today
   updated_at >= CURRENT_DATE

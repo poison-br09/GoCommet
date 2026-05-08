@@ -8,3 +8,4 @@ mistralai
 aiofiles
 python-multipart
 langgraph
+requests

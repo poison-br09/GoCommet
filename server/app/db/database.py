@@ -81,3 +81,27 @@ async def load_graph_thread_state(thread_id: str) -> GraphState | None:
         state = json.loads(state)
 
     return state
+
+
+async def list_graph_thread_states() -> list[dict[str, Any]]:
+    pool = await get_pool()
+    async with pool.acquire() as connection:
+        rows = await connection.fetch(
+            """
+            SELECT thread_id, state, updated_at
+            FROM graph_threads
+            ORDER BY updated_at DESC
+            """
+        )
+
+    records: list[dict[str, Any]] = []
+    for row in rows:
+        state: Any = row["state"]
+        if isinstance(state, str):
+            state = json.loads(state)
+        records.append({
+            "thread_id": row["thread_id"],
+            "state": state,
+            "updated_at": row["updated_at"],
+        })
+    return records
