@@ -62,6 +62,25 @@ Common PostgreSQL JSONB patterns for this table:
 
   -- jobs processed this week
   updated_at >= NOW() - INTERVAL '7 days'\
+
+Table: email_audit
+  thread_id              TEXT PRIMARY KEY — pipeline thread linked to graph_threads.thread_id
+  incoming_sender        TEXT             — original SU sender
+  incoming_subject       TEXT             — original inbound email subject
+  attachment_file_names  JSONB ARRAY      — names of attached files
+  attachment_paths       JSONB ARRAY      — stored local attachment paths
+  final_decision         TEXT             — router decision at send time
+  human_review_status    TEXT             — usually "sent"
+  validation_results     JSONB ARRAY      — validation rows at send time
+  outgoing_to            TEXT             — recipient of CG reply
+  outgoing_subject       TEXT             — sent reply subject
+  outgoing_body          TEXT             — approved reply content
+  delivery               TEXT             — "smtp" or "mock"
+  send_status            TEXT             — send status
+  message_id             TEXT             — SMTP Message-ID / delivery receipt id
+  sent_at                TIMESTAMPTZ      — send timestamp
+
+Use email_audit for questions about sent mail, delivery IDs, sent content, inbound email subjects, and attachment file names. Join with graph_threads on thread_id when pipeline state is also needed.\
 """
 
 _SQL_SYSTEM = """\

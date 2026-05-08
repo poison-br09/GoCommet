@@ -2,6 +2,7 @@ from typing import Any, TypedDict
 
 
 class GraphState(TypedDict):
+    thread_id: str
     incoming_email: dict[str, Any]
     mistral_markdown: list[dict[str, Any]] | None
     extracted_data: list[dict[str, Any]] | None

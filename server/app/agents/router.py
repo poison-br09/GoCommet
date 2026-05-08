@@ -24,32 +24,32 @@ def _route_from_validation_results(validation_results: list[FieldValidation]) ->
     return "auto_approve"
 
 
-def _mismatches(validation_results: list[FieldValidation]) -> list[FieldValidation]:
-    return [item for item in validation_results if item.status == "mismatch"]
+def _flagged(validation_results: list[FieldValidation]) -> list[FieldValidation]:
+    return [item for item in validation_results if item.status != "match"]
 
 
 def _build_amendment_email(validation_results: list[FieldValidation]) -> str:
     discrepancy_lines = "\n".join(
-        f'  • {item.field_name}: found "{item.found_value}" — expected "{item.expected_value}"'
-        for item in _mismatches(validation_results)
+        f'  - {item.field_name}: found "{item.found_value}" - expected "{item.expected_value}" ({item.status})'
+        for item in _flagged(validation_results)
     )
     return (
-        "Subject: Amendment Request — Shipping Document Discrepancy\n\n"
+        "Subject: Amendment Request - Shipping Document Discrepancy\n\n"
         "Dear Shipping Unit,\n\n"
-        "We have reviewed the submitted shipping document and identified the following "
-        "discrepancies against our contractual requirements:\n\n"
+        "We have reviewed the submitted shipping document set and identified the following "
+        "items that require correction or confirmation before approval:\n\n"
         f"{discrepancy_lines}\n\n"
-        "Please issue a corrected document addressing the above discrepancies at your earliest convenience.\n\n"
+        "Please issue corrected documents or confirm the uncertain values at your earliest convenience.\n\n"
         "Thank you for your prompt attention to this matter.\n\n"
         "GoComet Trade Compliance Team"
     )
 
 
 def _fallback_amendment_decision(validation_results: list[FieldValidation]) -> RouterDecision:
-    mismatched_fields = ", ".join(item.field_name for item in _mismatches(validation_results))
+    mismatched_fields = ", ".join(item.field_name for item in _flagged(validation_results))
     return RouterDecision(
         decision="draft_amendment",
-        reasoning=f"The field(s) {mismatched_fields} do not match the required values. A corrected document must be issued.",
+        reasoning=f"The field(s) {mismatched_fields} require correction or confirmation before approval.",
         draft_email=_build_amendment_email(validation_results),
     )
 
@@ -75,7 +75,7 @@ async def run_router(validation_results: list[FieldValidation]) -> RouterDecisio
                 "Manual review required because these fields are uncertain: "
                 f"{', '.join(uncertain_fields)}."
             ),
-            draft_email=None,
+            draft_email=_build_amendment_email(validation_results),
         )
         log.info("router  DONE  |  decision=flag_for_review  uncertain_fields=%s", uncertain_fields)
         return decision

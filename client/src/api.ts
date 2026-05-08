@@ -1,4 +1,4 @@
-import type { PendingReviewItem, PipelineResult } from "./types";
+import type { FieldValidation, PendingReviewItem, PipelineResult } from "./types";
 
 const BASE = `${import.meta.env.VITE_API_BASE_URL ?? ""}/api/v1`;
 const API_KEY = import.meta.env.VITE_API_KEY ?? "";
@@ -52,6 +52,30 @@ export async function resumePipeline(
   if (!res.ok) {
     const err = await res.json().catch(() => ({ detail: res.statusText }));
     throw new Error(err.detail ?? "Resume failed");
+  }
+
+  return res.json();
+}
+
+export async function applyReviewAction(
+  threadId: string,
+  row: FieldValidation,
+  action: "accept_found_value" | "mark_resolved",
+): Promise<PipelineResult> {
+  const res = await fetch(`${BASE}/pipeline/review-action/${threadId}`, {
+    method: "POST",
+    headers: headers({ "Content-Type": "application/json" }),
+    body: JSON.stringify({
+      field_name: row.field_name,
+      document_name: row.document_name ?? null,
+      validation_type: row.validation_type ?? null,
+      action,
+    }),
+  });
+
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ detail: res.statusText }));
+    throw new Error(err.detail ?? "Review action failed");
   }
 
   return res.json();

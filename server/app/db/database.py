@@ -1,4 +1,5 @@
 import json
+from datetime import datetime
 from typing import Any
 
 import asyncpg
@@ -7,6 +8,12 @@ from app.core.config import settings
 from app.core.state import GraphState
 
 _pool: asyncpg.Pool | None = None
+
+
+def _parse_timestamptz(value: str | datetime | None) -> datetime | None:
+    if value is None or isinstance(value, datetime):
+        return value
+    return datetime.fromisoformat(value.replace("Z", "+00:00"))
 
 
 def _database_dsn() -> str:
@@ -37,6 +44,29 @@ async def init_db() -> None:
             CREATE TABLE IF NOT EXISTS graph_threads (
                 thread_id TEXT PRIMARY KEY,
                 state JSONB NOT NULL,
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+            )
+            """
+        )
+        await connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS email_audit (
+                thread_id TEXT PRIMARY KEY REFERENCES graph_threads(thread_id) ON DELETE CASCADE,
+                incoming_sender TEXT,
+                incoming_subject TEXT,
+                attachment_file_names JSONB NOT NULL DEFAULT '[]'::jsonb,
+                attachment_paths JSONB NOT NULL DEFAULT '[]'::jsonb,
+                final_decision TEXT,
+                human_review_status TEXT,
+                validation_results JSONB,
+                outgoing_to TEXT,
+                outgoing_subject TEXT,
+                outgoing_body TEXT,
+                delivery TEXT,
+                send_status TEXT,
+                message_id TEXT,
+                sent_at TIMESTAMPTZ,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
                 updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
             )
             """
@@ -105,3 +135,84 @@ async def list_graph_thread_states() -> list[dict[str, Any]]:
             "updated_at": row["updated_at"],
         })
     return records
+
+
+async def save_email_audit_record(
+    *,
+    thread_id: str,
+    incoming_sender: str | None,
+    incoming_subject: str | None,
+    attachment_file_names: list[str],
+    attachment_paths: list[str],
+    final_decision: str | None,
+    human_review_status: str | None,
+    validation_results: list[dict[str, Any]] | None,
+    outgoing_to: str | None,
+    outgoing_subject: str | None,
+    outgoing_body: str | None,
+    delivery: str | None,
+    send_status: str | None,
+    message_id: str | None,
+    sent_at: str | datetime | None,
+) -> None:
+    parsed_sent_at = _parse_timestamptz(sent_at)
+    pool = await get_pool()
+    async with pool.acquire() as connection:
+        await connection.execute(
+            """
+            INSERT INTO email_audit (
+                thread_id,
+                incoming_sender,
+                incoming_subject,
+                attachment_file_names,
+                attachment_paths,
+                final_decision,
+                human_review_status,
+                validation_results,
+                outgoing_to,
+                outgoing_subject,
+                outgoing_body,
+                delivery,
+                send_status,
+                message_id,
+                sent_at,
+                updated_at
+            )
+            VALUES (
+                $1, $2, $3, $4::jsonb, $5::jsonb, $6, $7, $8::jsonb,
+                $9, $10, $11, $12, $13, $14, $15::timestamptz, now()
+            )
+            ON CONFLICT (thread_id)
+            DO UPDATE SET
+                incoming_sender = EXCLUDED.incoming_sender,
+                incoming_subject = EXCLUDED.incoming_subject,
+                attachment_file_names = EXCLUDED.attachment_file_names,
+                attachment_paths = EXCLUDED.attachment_paths,
+                final_decision = EXCLUDED.final_decision,
+                human_review_status = EXCLUDED.human_review_status,
+                validation_results = EXCLUDED.validation_results,
+                outgoing_to = EXCLUDED.outgoing_to,
+                outgoing_subject = EXCLUDED.outgoing_subject,
+                outgoing_body = EXCLUDED.outgoing_body,
+                delivery = EXCLUDED.delivery,
+                send_status = EXCLUDED.send_status,
+                message_id = EXCLUDED.message_id,
+                sent_at = EXCLUDED.sent_at,
+                updated_at = now()
+            """,
+            thread_id,
+            incoming_sender,
+            incoming_subject,
+            json.dumps(attachment_file_names),
+            json.dumps(attachment_paths),
+            final_decision,
+            human_review_status,
+            json.dumps(validation_results),
+            outgoing_to,
+            outgoing_subject,
+            outgoing_body,
+            delivery,
+            send_status,
+            message_id,
+            parsed_sent_at,
+        )

@@ -20,6 +20,7 @@ from app.graph.workflow import (
     get_pending_review_threads,
     get_review_queue_threads,
     get_thread_state,
+    persist_thread_state,
     resume_pipeline_thread,
     run_email_pipeline_thread,
 )
@@ -66,6 +67,13 @@ class PendingReviewItem(BaseModel):
     error_message: str | None = None
 
 
+class ReviewActionRequest(BaseModel):
+    field_name: str
+    document_name: str | None = None
+    validation_type: str | None = None
+    action: Literal["accept_found_value", "mark_resolved"]
+
+
 def _status_from_state(state: dict[str, Any]) -> PipelineStatus:
     review_status = state.get("human_review_status")
     if review_status == "failed":
@@ -80,6 +88,9 @@ def _status_from_state(state: dict[str, Any]) -> PipelineStatus:
 
 
 def _to_pipeline_result(thread_id: str, state: dict[str, Any]) -> PipelineResult:
+    draft = state.get("decision_reasoning_or_draft")
+    if not draft and state.get("validation_results") is not None:
+        draft = _draft_from_remaining_discrepancies(state)
     return PipelineResult(
         job_id=thread_id,
         thread_id=thread_id,
@@ -88,7 +99,7 @@ def _to_pipeline_result(thread_id: str, state: dict[str, Any]) -> PipelineResult
         extracted_data=state.get("extracted_data"),
         validation_results=state.get("validation_results"),
         final_decision=state.get("final_decision"),
-        decision_reasoning_or_draft=state.get("decision_reasoning_or_draft"),
+        decision_reasoning_or_draft=draft,
         human_review_status=state.get("human_review_status"),
         edited_email_text=state.get("edited_email_text"),
         mock_send_result=state.get("mock_send_result"),
@@ -97,13 +108,16 @@ def _to_pipeline_result(thread_id: str, state: dict[str, Any]) -> PipelineResult
 
 
 def _review_queue_item(record: dict[str, Any]) -> PendingReviewItem:
+    draft = record["state"].get("decision_reasoning_or_draft")
+    if not draft and record["state"].get("validation_results") is not None:
+        draft = _draft_from_remaining_discrepancies(record["state"])
     return PendingReviewItem(
         thread_id=record["thread_id"],
         updated_at=record["updated_at"],
         status=_status_from_state(record["state"]),
         incoming_email=record["state"].get("incoming_email"),
         final_decision=record["state"].get("final_decision"),
-        decision_reasoning_or_draft=record["state"].get("decision_reasoning_or_draft"),
+        decision_reasoning_or_draft=draft,
         validation_results=record["state"].get("validation_results"),
         error_message=record["state"].get("error_message"),
     )
@@ -116,6 +130,61 @@ def _assert_stream_api_key(api_key: str) -> None:
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid or missing API key.",
         )
+
+
+def _same_validation_row(row: dict[str, Any], body: ReviewActionRequest) -> bool:
+    if row.get("field_name") != body.field_name:
+        return False
+    if body.document_name is not None and row.get("document_name") != body.document_name:
+        return False
+    if body.validation_type is not None and row.get("validation_type") != body.validation_type:
+        return False
+    return row.get("status") != "match"
+
+
+def _remaining_flagged_rows(state: dict[str, Any]) -> list[dict[str, Any]]:
+    return [
+        row
+        for row in state.get("validation_results") or []
+        if row.get("status") in {"mismatch", "uncertain"}
+    ]
+
+
+def _draft_from_remaining_discrepancies(state: dict[str, Any]) -> str:
+    incoming_email = state.get("incoming_email") or {}
+    subject = incoming_email.get("subject", "submitted shipment documents")
+    flagged = _remaining_flagged_rows(state)
+    if not flagged:
+        return (
+            f"Subject: Approved - {subject}\n\n"
+            "Dear Shipping Unit,\n\n"
+            "We have reviewed the submitted shipment document set and the validation checks are clear. "
+            "The documents are approved for onward processing.\n\n"
+            "Thank you,\n"
+            "GoComet Trade Compliance Team"
+        )
+
+    lines = [
+        "Subject: Amendment Request - Shipping Document Discrepancy",
+        "",
+        "Dear Shipping Unit,",
+        "",
+        "The document set was reviewed and the following discrepancies require correction:",
+    ]
+    for row in flagged:
+        document = row.get("document_name") or "document"
+        field = row.get("field_name") or "field"
+        found = row.get("found_value") or "-"
+        expected = row.get("expected_value") or "-"
+        status = row.get("status")
+        lines.append(f"  - {document}: {field} ({status}) - found \"{found}\"; expected \"{expected}\"")
+    lines.extend([
+        "",
+        "Please issue corrected documents at your earliest convenience.",
+        "",
+        "GoComet Trade Compliance Team",
+    ])
+    return "\n".join(lines)
 
 
 @router.post(
@@ -281,6 +350,64 @@ async def review_queue_stream(
 
 
 @router.post(
+    "/pipeline/review-action/{thread_id}",
+    response_model=PipelineResult,
+    summary="Apply a CG review action to one validation row",
+)
+async def apply_review_action(
+    thread_id: str,
+    body: ReviewActionRequest,
+    _: str = Security(require_api_key),
+) -> PipelineResult:
+    state = await get_thread_state(thread_id)
+    if state is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Pipeline thread not found.",
+        )
+    if state.get("human_review_status") not in {"pending", "approved"}:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Review actions are only allowed while pending review; current status is {state.get('human_review_status')}.",
+        )
+
+    validation_results = list(state.get("validation_results") or [])
+    changed = False
+    for row in validation_results:
+        if not _same_validation_row(row, body):
+            continue
+
+        if body.action == "accept_found_value":
+            row["expected_value"] = row.get("found_value")
+            row["resolution_action"] = "accepted_found_value"
+        else:
+            row["resolution_action"] = "marked_resolved"
+        row["resolved_by"] = "cg_operator"
+        row["status"] = "match"
+        changed = True
+        break
+
+    if not changed:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="No matching unresolved validation row found.",
+        )
+
+    updated_state = {
+        **state,
+        "validation_results": validation_results,
+        "final_decision": "auto_approve" if not _remaining_flagged_rows({"validation_results": validation_results}) else "draft_amendment",
+        "decision_reasoning_or_draft": _draft_from_remaining_discrepancies({
+            **state,
+            "validation_results": validation_results,
+        }),
+        "edited_email_text": None,
+    }
+    await persist_thread_state(thread_id, updated_state)
+    return _to_pipeline_result(thread_id, updated_state)
+
+
+@router.post(
     "/pipeline/resume/{thread_id}",
     response_model=PipelineResult,
     summary="Resume a paused pipeline after CG approval",
@@ -296,6 +423,8 @@ async def resume_pipeline(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Pipeline thread not found.",
         )
+    if state.get("human_review_status") == "sent":
+        return _to_pipeline_result(thread_id, state)
     if state.get("human_review_status") not in {"pending", "approved"}:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,

@@ -15,7 +15,15 @@ from app.core.state import GraphState
 from app.db.database import (
     list_graph_thread_states,
     load_graph_thread_state,
+    save_email_audit_record,
     save_graph_thread_state,
+)
+from app.ingestion.outbound_email import (
+    normalize_recipient,
+    smtp_configuration_status,
+    send_review_email,
+    smtp_is_configured,
+    split_subject_and_body,
 )
 from app.schemas.events import EmailPayload
 from app.schemas.extraction import ExtractionOutput
@@ -23,12 +31,14 @@ from app.schemas.validation import FieldValidation
 
 log = get_logger(__name__)
 _workflow: Any | None = None
+_resume_locks: dict[str, asyncio.Lock] = {}
 
 CRITICAL_CROSS_DOC_FIELDS = ("hs_code", "consignee_name")
 
 
-def _initial_state(incoming_email: EmailPayload) -> GraphState:
+def _initial_state(incoming_email: EmailPayload, thread_id: str) -> GraphState:
     return {
+        "thread_id": thread_id,
         "incoming_email": incoming_email.model_dump(),
         "mistral_markdown": None,
         "extracted_data": None,
@@ -65,7 +75,7 @@ async def get_pending_review_threads() -> list[dict[str, Any]]:
 
 async def get_review_queue_threads() -> list[dict[str, Any]]:
     records = await list_graph_thread_states()
-    queue_statuses = {"processing", "pending", "failed"}
+    queue_statuses = {"processing", "pending", "failed", "sent"}
     return [
         {
             "thread_id": record["thread_id"],
@@ -82,6 +92,15 @@ def _field_value(extraction: dict[str, Any], field_name: str) -> str | None:
     if isinstance(field, dict):
         value = field.get("value")
         return str(value).strip() if value is not None and str(value).strip() else None
+    return None
+
+
+def _field_confidence(extraction: dict[str, Any], field_name: str) -> float | None:
+    field = extraction.get(field_name)
+    if isinstance(field, dict):
+        confidence = field.get("confidence")
+        if isinstance(confidence, int | float):
+            return float(confidence)
     return None
 
 
@@ -176,6 +195,7 @@ async def cross_document_validate_node(state: GraphState) -> dict[str, Any]:
                 "document_name": item.get("document_name") or Path(item.get("path", "")).name,
                 "path": item.get("path"),
                 "value": _field_value(item, field_name),
+                "confidence": _field_confidence(item, field_name),
                 "snippet": _source_snippet(
                     markdown_by_path.get(item.get("path"), ""),
                     _field_value(item, field_name),
@@ -202,6 +222,7 @@ async def cross_document_validate_node(state: GraphState) -> dict[str, Any]:
                 "expected_value": expected_value,
                 "document_name": item["document_name"],
                 "source_snippet": item["snippet"],
+                "confidence": item["confidence"],
                 "validation_type": "cross_document",
             })
 
@@ -229,6 +250,9 @@ async def validate_node(state: GraphState) -> dict[str, Any]:
         for result in document_results:
             row = result.model_dump()
             row["document_name"] = document_name
+            field_data = extraction_payload.get(row.get("field_name"))
+            if isinstance(field_data, dict):
+                row["confidence"] = field_data.get("confidence")
             row["source_snippet"] = _source_snippet(
                 next(
                     (
@@ -263,6 +287,37 @@ def _approval_email(state: GraphState) -> str:
     )
 
 
+def _draft_email_from_state(state: GraphState) -> str:
+    validation_results = state.get("validation_results") or []
+    flagged = [item for item in validation_results if item.get("status") != "match"]
+    if not flagged:
+        return _approval_email(state)
+
+    lines = [
+        "Subject: Amendment Request - Shipping Document Discrepancy",
+        "",
+        "Dear Shipping Unit,",
+        "",
+        "We have reviewed the submitted shipping document set and identified the following items that require correction or confirmation before approval:",
+    ]
+    for item in flagged:
+        document = item.get("document_name") or "document"
+        field_name = item.get("field_name") or "field"
+        found = item.get("found_value") or "-"
+        expected = item.get("expected_value") or "-"
+        status = item.get("status") or "review"
+        lines.append(f'  - {document}: {field_name} ({status}) - found "{found}"; expected "{expected}"')
+    lines.extend([
+        "",
+        "Please issue corrected documents or confirm the uncertain values at your earliest convenience.",
+        "",
+        "Thank you for your prompt attention to this matter.",
+        "",
+        "GoComet Trade Compliance Team",
+    ])
+    return "\n".join(lines)
+
+
 async def route_node(state: GraphState) -> dict[str, Any]:
     if state["validation_results"] is None:
         raise ValueError("Cannot route before validation is complete")
@@ -271,7 +326,7 @@ async def route_node(state: GraphState) -> dict[str, Any]:
         FieldValidation.model_validate(item) for item in state["validation_results"]
     ]
     routing_decision = await run_router(validation_results)
-    draft_or_reasoning = routing_decision.draft_email or routing_decision.reasoning
+    draft_or_reasoning = routing_decision.draft_email or _draft_email_from_state(state)
     if routing_decision.decision == "auto_approve":
         draft_or_reasoning = _approval_email(state)
 
@@ -288,26 +343,69 @@ async def route_node(state: GraphState) -> dict[str, Any]:
 
 
 async def send_email_node(state: GraphState) -> dict[str, Any]:
-    incoming_email = state["incoming_email"]
+    thread_id = state.get("thread_id")
+    incoming_email = state.get("incoming_email") or {
+        "sender": "shipping.unit@example.com",
+        "subject": "Shipment documents",
+        "attachment_paths": [],
+    }
     approved_text = state.get("edited_email_text") or state.get("decision_reasoning_or_draft")
     if not approved_text:
         raise ValueError("Cannot send without approved email text")
 
-    mock_send_result = {
-        "to": incoming_email.get("sender"),
-        "subject": f"Re: {incoming_email.get('subject')}",
-        "body": approved_text,
+    default_subject = f"Re: {incoming_email.get('subject') or 'Shipment documents'}"
+    subject, body = split_subject_and_body(default_subject, approved_text)
+    raw_to_address = incoming_email.get("sender") or "shipping.unit@example.com"
+    send_result = {
+        "to": raw_to_address,
+        "subject": subject,
+        "body": body,
         "status": "sent",
+        "delivery": "mock",
     }
+    if smtp_is_configured():
+        to_address = normalize_recipient(raw_to_address)
+        send_result.update(await send_review_email(to_address, subject, body))
+        send_result["to"] = to_address
+    else:
+        log.warning(
+            "send_email_node  SMTP_NOT_USED  |  reason=%s",
+            smtp_configuration_status(),
+        )
+
     log.info(
-        "send_email_node  MOCK_SENT  |  to=%s  subject=%r",
-        mock_send_result["to"],
-        mock_send_result["subject"],
+        "send_email_node  SENT  |  delivery=%s  to=%s  subject=%r",
+        send_result["delivery"],
+        send_result["to"],
+        send_result["subject"],
     )
-    return {
+    result = {
         "human_review_status": "sent",
-        "mock_send_result": mock_send_result,
+        "mock_send_result": send_result,
     }
+    if thread_id:
+        await persist_thread_state(thread_id, {**state, **result})
+
+    if thread_id:
+        attachment_paths = incoming_email.get("attachment_paths") or []
+        await save_email_audit_record(
+            thread_id=thread_id,
+            incoming_sender=incoming_email.get("sender"),
+            incoming_subject=incoming_email.get("subject"),
+            attachment_file_names=[Path(path).name for path in attachment_paths],
+            attachment_paths=attachment_paths,
+            final_decision=state.get("final_decision"),
+            human_review_status="sent",
+            validation_results=state.get("validation_results"),
+            outgoing_to=send_result.get("to"),
+            outgoing_subject=send_result.get("subject"),
+            outgoing_body=send_result.get("body"),
+            delivery=send_result.get("delivery"),
+            send_status=send_result.get("status"),
+            message_id=send_result.get("message_id"),
+            sent_at=send_result.get("sent_at"),
+        )
+    return result
 
 
 async def initialize_langgraph_workflow() -> Any:
@@ -342,7 +440,7 @@ async def run_email_pipeline_thread(thread_id: str, incoming_email: EmailPayload
         thread_id,
         incoming_email.subject,
     )
-    state = _initial_state(incoming_email)
+    state = _initial_state(incoming_email, thread_id)
     workflow = await initialize_langgraph_workflow()
     graph_config = {"configurable": {"thread_id": thread_id}}
     final_state = state
@@ -386,59 +484,68 @@ async def run_email_pipeline_thread(thread_id: str, incoming_email: EmailPayload
 
 
 async def resume_pipeline_thread(thread_id: str, edited_email_text: str) -> GraphState:
-    persisted = await get_thread_state(thread_id)
-    if persisted is None:
-        raise ValueError(f"Pipeline thread not found: {thread_id}")
+    lock = _resume_locks.setdefault(thread_id, asyncio.Lock())
+    async with lock:
+        persisted = await get_thread_state(thread_id)
+        if persisted is None:
+            raise ValueError(f"Pipeline thread not found: {thread_id}")
+        if persisted.get("human_review_status") == "sent":
+            log.info("resume_pipeline_thread  ALREADY_SENT  |  thread_id=%s", thread_id)
+            return persisted
 
-    workflow = await initialize_langgraph_workflow()
-    graph_config = {"configurable": {"thread_id": thread_id}}
-    try:
-        await workflow.aupdate_state(
-            graph_config,
-            {
-                "edited_email_text": edited_email_text,
-                "human_review_status": "approved",
-            },
-            as_node="route",
-        )
-    except Exception as exc:
-        log.warning(
-            "resume_pipeline_thread  CHECKPOINT_MISSING  |  thread_id=%s  falling back to persisted state: %s",
-            thread_id,
-            exc,
-        )
         approved_state: GraphState = {
             **persisted,
+            "thread_id": thread_id,
             "edited_email_text": edited_email_text,
             "human_review_status": "approved",
         }
-        final_state: GraphState = {
-            **approved_state,
-            **await send_email_node(approved_state),
-        }
+        await persist_thread_state(thread_id, approved_state)
+
+        workflow = await initialize_langgraph_workflow()
+        graph_config = {"configurable": {"thread_id": thread_id}}
+        try:
+            await workflow.aupdate_state(
+                graph_config,
+                approved_state,
+                as_node="route",
+            )
+            final_state: GraphState | None = None
+            async for graph_state in workflow.astream(
+                None,
+                config=graph_config,
+                stream_mode="values",
+            ):
+                final_state = {
+                    **approved_state,
+                    **graph_state,
+                }
+                await persist_thread_state(thread_id, final_state)
+        except Exception as exc:
+            log.warning(
+                "resume_pipeline_thread  CHECKPOINT_RESUME_FAILED  |  thread_id=%s  falling back to persisted state: %s",
+                thread_id,
+                exc,
+            )
+            final_state = None
+
+        latest = await get_thread_state(thread_id)
+        if latest and latest.get("human_review_status") == "sent":
+            return latest
+
+        if final_state is None:
+            final_state = {
+                **approved_state,
+                **await send_email_node(approved_state),
+            }
+
         await persist_thread_state(thread_id, final_state)
         return final_state
-
-    final_state: GraphState | None = None
-    async for graph_state in workflow.astream(
-        None,
-        config=graph_config,
-        stream_mode="values",
-    ):
-        final_state = graph_state
-        await persist_thread_state(thread_id, final_state)
-
-    if final_state is None:
-        final_state = persisted
-
-    await persist_thread_state(thread_id, final_state)
-    return final_state
 
 
 async def create_graph_thread(incoming_email: EmailPayload, thread_id: str | None = None) -> str:
     thread_id = thread_id or uuid4().hex
     log.info("create_graph_thread  |  thread_id=%s  subject=%r", thread_id, incoming_email.subject)
-    await persist_thread_state(thread_id, _initial_state(incoming_email))
+    await persist_thread_state(thread_id, _initial_state(incoming_email, thread_id))
     return thread_id
 
 

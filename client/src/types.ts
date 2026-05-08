@@ -37,7 +37,12 @@ export interface FieldValidation {
   expected_value: string | null;
   document_name?: string | null;
   source_snippet?: string | null;
+  source_doc?: string | null;
+  source_doc_expected?: string | null;
+  confidence?: number | null;
   validation_type?: "cross_document" | "customer_rules" | string;
+  resolution_action?: string | null;
+  resolved_by?: string | null;
 }
 
 export type Decision =
@@ -45,39 +50,45 @@ export type Decision =
   | "flag_for_review"
   | "draft_amendment";
 
+export interface IncomingEmail {
+  sender: string;
+  sender_name?: string;
+  subject: string;
+  attachment_paths: string[];
+  preview?: string;
+}
+
 export interface PipelineResult {
   job_id: string;
   thread_id: string;
+  received_at?: string;
   status: "processing" | "pending_review" | "sent" | "complete" | "failed";
-  incoming_email: {
-    sender: string;
-    subject: string;
-    attachment_paths: string[];
-  } | null;
-  extracted_data: ExtractionOutput[] | ExtractionOutput | null;
+  incoming_email: IncomingEmail | null;
+  extracted_data: ExtractionOutput[] | ExtractionOutput | Record<string, FieldValue> | null;
   validation_results: FieldValidation[] | null;
   final_decision: Decision | null;
   decision_reasoning_or_draft: string | null;
   human_review_status: string | null;
   edited_email_text: string | null;
   mock_send_result: {
-    to: string;
-    subject: string;
-    body: string;
-    status: string;
+    to?: string;
+    subject?: string;
+    body?: string;
+    status?: string;
+    delivery?: string;
+    sent_at?: string;
+    message_id?: string;
   } | null;
   error_message: string | null;
+  progress?: { stage: string; pct: number };
 }
 
 export interface PendingReviewItem {
   thread_id: string;
   updated_at: string;
+  received_at?: string;
   status: PipelineResult["status"] | null;
-  incoming_email: {
-    sender: string;
-    subject: string;
-    attachment_paths: string[];
-  } | null;
+  incoming_email: IncomingEmail | null;
   final_decision: Decision | string | null;
   decision_reasoning_or_draft: string | null;
   validation_results: FieldValidation[] | null;

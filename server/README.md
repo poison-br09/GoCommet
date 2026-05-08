@@ -1,11 +1,6 @@
 # Nova Pipeline — Server
 
-Async multi-agent trade document processing pipeline.  
-Accepts Bills of Lading, Commercial Invoices, and Packing Lists (PDF / PNG / JPG) and runs them through three agents:
-
-1. **Extractor** — Mistral OCR + OpenAI GPT-4o-mini → structured JSON with per-field confidence scores  
-2. **Validator** — GPT-4o-mini checks extracted fields against customer rules (port of discharge, Incoterms)  
-3. **Router** — GPT-4o-mini decides: auto-approve, flag for review, or draft amendment email
+FastAPI + LangGraph backend for the Nova trade document workflow. The server ingests normalized email events, processes multiple attached documents, pauses for CG review, sends approved replies through SMTP, and stores both pipeline state and email audit records in PostgreSQL.
 
 ---
 
@@ -14,60 +9,54 @@ Accepts Bills of Lading, Commercial Invoices, and Packing Lists (PDF / PNG / JPG
 | Requirement | Version |
 |---|---|
 | Python | 3.12+ |
-| PostgreSQL | 14+ (running locally) |
-| OpenAI API key | — |
-| Mistral API key | — |
+| PostgreSQL | 14+ |
+| OpenAI API key | Required |
+| Mistral API key | Required |
+| Gmail app password or SMTP credentials | Required for real email send |
 
 ---
 
 ## Setup
 
-### 1. Create and activate a virtual environment
-
 ```bash
 cd server
 python3 -m venv gocometvenv
-source gocometvenv/bin/activate      # macOS / Linux
-# gocometvenv\Scripts\activate       # Windows
-```
-
-### 2. Install dependencies
-
-```bash
+source gocometvenv/bin/activate
 pip install -r requirements.txt
+cp .env.example .env
 ```
 
-### 3. Create the database
-
-Connect to PostgreSQL and create the database:
+Create the database if needed:
 
 ```sql
 CREATE DATABASE Nova;
 ```
 
-The `graph_threads` table is created automatically on first startup.
-
-### 4. Configure environment variables
-
-```bash
-cp .env.example .env
-```
-
-Edit `.env` and fill in your values:
+Fill `.env`:
 
 ```env
 OPENAI_API_KEY=sk-...
 MISTRAL_API_KEY=...
 DATABASE_URL=postgresql+asyncpg://postgres:your_password@localhost:5432/Nova
 API_KEY=your_chosen_api_key
+
+IMAP_ENABLED=true
+IMAP_HOST=imap.gmail.com
+IMAP_PORT=993
+IMAP_USERNAME=your_email@gmail.com
+IMAP_PASSWORD=your_app_password
+IMAP_FOLDER=INBOX
+IMAP_SEARCH_CRITERIA=UNSEEN
+IMAP_MARK_SEEN=true
+IMAP_POLL_INTERVAL_SECONDS=60
+
+SMTP_ENABLED=true
+SMTP_HOST=smtp.gmail.com
+SMTP_PORT=587
+SMTP_USE_TLS=true
 ```
 
-| Variable | Description |
-|---|---|
-| `OPENAI_API_KEY` | OpenAI API key (used by Extractor, Validator, Router, Query agents) |
-| `MISTRAL_API_KEY` | Mistral API key (used for OCR) |
-| `DATABASE_URL` | PostgreSQL connection string using `asyncpg` driver |
-| `API_KEY` | Secret key required in the `x-api-key` header for all API requests |
+SMTP reuses IMAP credentials unless `SMTP_USERNAME`, `SMTP_PASSWORD`, and `SMTP_FROM_EMAIL` are provided.
 
 ---
 
@@ -76,125 +65,121 @@ API_KEY=your_chosen_api_key
 ```bash
 cd server
 source gocometvenv/bin/activate
-uvicorn app.main:app --reload
+python3 -m uvicorn app.main:app --reload
 ```
 
-Server starts at **http://localhost:8000**
+Server starts at `http://localhost:8000`. Interactive docs are at `http://localhost:8000/docs`.
 
-> **Note:** `uvicorn --reload` only watches `.py` files. If you change `.env`, restart the server manually with `Ctrl+C` then re-run.
+Changing `.env` requires a manual server restart.
+
+---
+
+## Workflow
+
+1. Ingestion creates an `EmailPayload` with `sender`, `subject`, and `attachment_paths`.
+2. Extractor runs OCR/extraction concurrently for every attachment.
+3. Cross-document validator checks `hs_code` and `consignee_name` across the shipment document set.
+4. Customer rule validator checks port of discharge and Incoterms.
+5. Router drafts an approval or amendment email.
+6. LangGraph pauses before send.
+7. CG approves edited draft through `/pipeline/resume/{thread_id}`.
+8. Server sends via SMTP and stores audit metadata.
 
 ---
 
 ## API Endpoints
 
-Interactive docs available at **http://localhost:8000/docs** — click **Authorize** and enter your `API_KEY` before making requests.
+All non-stream endpoints require `x-api-key: <API_KEY>`.
 
 | Method | Endpoint | Description |
 |---|---|---|
 | `GET` | `/health` | Service health check |
-| `POST` | `/api/v1/pipeline/process` | Upload a trade document — returns `job_id` immediately (async) |
-| `GET` | `/api/v1/pipeline/status/{job_id}` | Poll for pipeline result |
-| `POST` | `/api/v1/query` | Ask a natural language question over stored pipeline data |
+| `POST` | `/api/v1/webhook/incoming-email` | Start a thread from normalized email payload |
+| `POST` | `/api/v1/pipeline/process` | API-only multipart upload; wraps files into one email event |
+| `GET` | `/api/v1/pipeline/review-queue` | Processing, pending, failed, and sent workflow threads |
+| `GET` | `/api/v1/pipeline/review-queue/stream?api_key=...` | SSE queue stream for frontend |
+| `GET` | `/api/v1/pipeline/status/{thread_id}` | Full thread state |
+| `POST` | `/api/v1/pipeline/review-action/{thread_id}` | Accept found value or mark a discrepancy resolved |
+| `POST` | `/api/v1/pipeline/resume/{thread_id}` | Approve draft and send email; idempotent after sent |
+| `POST` | `/api/v1/query` | NL query over graph state and email audit data |
 
-### Submit a document
-
-```bash
-curl -X POST http://localhost:8000/api/v1/pipeline/process \
-  -H "x-api-key: your_chosen_api_key" \
-  -F "file=@/path/to/bill_of_lading.pdf"
-```
-
-Response:
-```json
-{ "job_id": "a3f9c2d1e4b8..." }
-```
-
-### Check result
+Example webhook:
 
 ```bash
-curl http://localhost:8000/api/v1/pipeline/status/a3f9c2d1e4b8 \
-  -H "x-api-key: your_chosen_api_key"
-```
-
-Response when complete:
-```json
-{
-  "job_id": "a3f9c2d1e4b8...",
-  "status": "complete",
-  "extracted_data": {
-    "consignee_name": { "value": "AL NASER TRADING COMPANY LLC", "confidence": 0.95 },
-    "port_of_discharge": { "value": "Jebel Ali", "confidence": 0.92 },
-    "incoterms": { "value": null, "confidence": null },
-    "global_confidence_score": 0.85,
-    "line_items": null
-  },
-  "validation_results": [
-    { "field_name": "port_of_discharge", "status": "mismatch", "found_value": "Jebel Ali", "expected_value": "Los Angeles" },
-    { "field_name": "incoterms", "status": "uncertain", "found_value": null, "expected_value": "CIF" }
-  ],
-  "final_decision": "draft_amendment",
-  "decision_reasoning_or_draft": "Subject: Amendment Request..."
-}
-```
-
-### Natural language query
-
-```bash
-curl -X POST http://localhost:8000/api/v1/query \
+curl -X POST http://localhost:8000/api/v1/webhook/incoming-email \
   -H "x-api-key: your_chosen_api_key" \
   -H "Content-Type: application/json" \
-  -d '{"question": "How many shipments were flagged for review this week?"}'
+  -d '{
+    "sender": "shipping.unit@example.com",
+    "subject": "Shipment docs",
+    "attachment_paths": ["/tmp/bol.pdf", "/tmp/invoice.pdf", "/tmp/packing-list.pdf"]
+  }'
 ```
 
-Response:
-```json
-{
-  "question": "How many shipments were flagged for review this week?",
-  "sql": "SELECT COUNT(*) FROM graph_threads WHERE state->>'final_decision' = 'flag_for_review' AND updated_at >= NOW() - INTERVAL '7 days'",
-  "answer": "3 shipments were flagged for human review this week.",
-  "rows": [{ "count": 3 }],
-  "row_count": 1
-}
+Example approve/send:
+
+```bash
+curl -X POST http://localhost:8000/api/v1/pipeline/resume/<thread_id> \
+  -H "x-api-key: your_chosen_api_key" \
+  -H "Content-Type: application/json" \
+  -d '{"edited_email_text": "Subject: Amendment Request\n\nDear Shipping Unit,\n..."}'
+```
+
+---
+
+## Persistence
+
+Tables are created automatically in `init_db()`:
+
+- `graph_threads`
+  - `thread_id`
+  - `state` JSONB
+  - `updated_at`
+- `email_audit`
+  - inbound sender/subject
+  - attachment names/paths
+  - validation results at send time
+  - outgoing recipient/subject/body
+  - delivery mode/status
+  - SMTP Message-ID and `sent_at`
+
+Useful audit query:
+
+```sql
+SELECT thread_id, incoming_subject, attachment_file_names, outgoing_subject, delivery, send_status, sent_at
+FROM email_audit
+ORDER BY sent_at DESC;
 ```
 
 ---
 
 ## Project Structure
 
-```
+```text
 server/
 ├── app/
-│   ├── main.py                      # FastAPI app, CORS, router registration
-│   ├── core/
-│   │   ├── config.py                # Pydantic settings (reads .env)
-│   │   ├── logger.py                # Rotating file + console logger
-│   │   ├── security.py              # x-api-key authentication
-│   │   └── state.py                 # LangGraph GraphState TypedDict
-│   ├── agents/
-│   │   ├── extractor_cascade.py     # Mistral OCR → OpenAI structured extraction
-│   │   ├── validator.py             # LLM field validation against customer rules
-│   │   ├── router.py                # LLM routing decision + amendment email
-│   │   └── query_agent.py           # NL → SQL → NL answer
-│   ├── graph/
-│   │   └── workflow.py              # LangGraph pipeline: extract → validate → route
-│   ├── api/v1/endpoints/
-│   │   ├── pipeline.py              # /pipeline/process and /pipeline/status
-│   │   └── query.py                 # /query
-│   ├── db/
-│   │   └── database.py              # asyncpg pool, graph_threads table
-│   └── schemas/
-│       ├── extraction.py            # ExtractionOutput, FieldValue, LineItem
-│       ├── validation.py            # FieldValidation
-│       └── routing.py               # RouterDecision
+│   ├── main.py                  # FastAPI app and startup/shutdown hooks
+│   ├── agents/                  # Extractor, validator, router, query agent
+│   ├── api/v1/endpoints/        # Pipeline and query routes
+│   ├── core/                    # Settings, state, security, logging
+│   ├── db/database.py           # asyncpg pool, graph_threads, email_audit
+│   ├── graph/workflow.py        # LangGraph workflow and human-review resume
+│   ├── ingestion/               # IMAP worker and SMTP outbound helper
+│   └── schemas/                 # Pydantic request/response models
 ├── logs/
-│   └── nova_pipeline.log            # Rotating log file (auto-created)
 ├── requirements.txt
-├── .env                             # Your secrets (not committed)
-└── .env.example                     # Template
+├── .env
+└── .env.example
 ```
 
 ---
 
-## Logs
+## Checks
 
-All agent inputs and outputs are logged to `server/logs/nova_pipeline.log` (DEBUG level) and to the console (INFO level). The log file rotates at 10 MB, keeping 5 backups.
+```bash
+cd server
+source gocometvenv/bin/activate
+python3 -m compileall app
+```
+
+Logs are written to `server/logs/nova_pipeline.log` and to the console.

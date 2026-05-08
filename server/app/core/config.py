@@ -19,6 +19,13 @@ class Settings(BaseSettings):
     imap_mark_seen: bool = Field(default=True, env="IMAP_MARK_SEEN")
     imap_poll_interval_seconds: int = Field(default=60, env="IMAP_POLL_INTERVAL_SECONDS")
     imap_attachments_dir: str = Field(default="/tmp/gocomet_imap_attachments", env="IMAP_ATTACHMENTS_DIR")
+    smtp_enabled: bool = Field(default=True, env="SMTP_ENABLED")
+    smtp_host: str = Field(default="smtp.gmail.com", env="SMTP_HOST")
+    smtp_port: int = Field(default=587, env="SMTP_PORT")
+    smtp_username: str | None = Field(default=None, env="SMTP_USERNAME")
+    smtp_password: SecretStr | None = Field(default=None, env="SMTP_PASSWORD")
+    smtp_from_email: str | None = Field(default=None, env="SMTP_FROM_EMAIL")
+    smtp_use_tls: bool = Field(default=True, env="SMTP_USE_TLS")
 
     class Config:
         env_file = ".env"
