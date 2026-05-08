@@ -1,38 +1,24 @@
-# GoComet Assignment — Trade Document Processing Pipeline
+# GoComet Assignment — Nova Trade Document Workflow
 
-An AI-powered trade document processing system with a multi-agent backend and a React frontend. Upload shipping/trade documents, extract structured fields via OCR + LLM, validate them against business rules, and query the processed data in natural language.
+An AI-powered trade document validation workflow for Cargo Group (CG) operators. The system accepts a normalized incoming-email event, processes all attached shipment documents, cross-validates them, drafts a reply to the Shipping Unit (SU), and pauses for human approval before any mock send.
 
 ![Architecture Diagram](arch_diagram_small.png)
 
 ---
 
-## Table of Contents
-
-- [Overview](#overview)
-- [Tech Stack](#tech-stack)
-- [Prerequisites](#prerequisites)
-- [Project Structure](#project-structure)
-- [Setup](#setup)
-  - [1. Clone the repository](#1-clone-the-repository)
-  - [2. Database setup](#2-database-setup)
-  - [3. Backend setup](#3-backend-setup)
-  - [4. Frontend setup](#4-frontend-setup)
-- [Running the App](#running-the-app)
-- [Environment Variables](#environment-variables)
-- [API Reference](#api-reference)
-- [Features](#features)
-
----
-
 ## Overview
 
-The pipeline processes trade documents (invoices, bills of lading, etc.) through a three-stage LangGraph workflow:
+The Part 2 workflow extends the Part 1 document pipeline into an event-driven CG review desk:
 
-1. **Extract** — Mistral OCR converts the document to markdown; GPT-4o-mini extracts 8 structured fields plus line items.
-2. **Validate** — GPT-4o-mini checks each field against customer rules and flags anomalies.
-3. **Route** — The router decides: auto-approve, flag for human review, or draft an amendment email.
+1. **Trigger** — a simulated email source posts a stable `EmailPayload` webhook containing sender, subject, and local attachment paths.
+2. **Extract** — Mistral OCR + GPT-4o-mini extract structured fields from every attachment concurrently.
+3. **Cross-validate** — pure Python checks fields that must match across documents in the same email, currently `hs_code` and `consignee_name`.
+4. **Validate rules** — existing customer rules validation checks required fields such as port of discharge and Incoterms.
+5. **Decide & draft** — the Router Agent drafts an approval or amendment email.
+6. **Human review** — LangGraph pauses before `send_email_node`; CG edits the draft and clicks approve.
+7. **Store & query** — graph state is stored in PostgreSQL and remains queryable through the natural-language query layer.
 
-A React + TypeScript frontend lets you upload documents, poll for results, and query stored data with natural language.
+The frontend is a React CG Workflow screen with live queue updates via Server-Sent Events (SSE). New incoming emails appear without refreshing the page, while the selected review pane is never replaced unless the operator clicks **Load update**.
 
 ---
 
@@ -42,43 +28,31 @@ A React + TypeScript frontend lets you upload documents, poll for results, and q
 |---|---|
 | Frontend | React 18, TypeScript, Vite |
 | Backend | Python 3.12+, FastAPI, Uvicorn |
-| AI Agents | LangGraph, OpenAI (GPT-4o-mini), Mistral (OCR) |
+| AI Agents | LangGraph, OpenAI GPT-4o-mini, Mistral OCR |
 | Database | PostgreSQL 14+, asyncpg |
-
----
-
-## Prerequisites
-
-Make sure the following are installed before proceeding:
-
-- **Node.js** v18+ and **npm** v9+
-- **Python** 3.12+
-- **PostgreSQL** 14+ running locally
-- An **OpenAI API key** (GPT-4o-mini access)
-- A **Mistral API key**
+| Ingestion | Stable FastAPI webhook, mock trigger script, optional IMAP adapter |
 
 ---
 
 ## Project Structure
 
-```
+```text
 GoComet_Assignment/
-├── client/               # React + TypeScript frontend (Vite, port 3000)
-│   ├── src/
-│   │   ├── App.tsx       # Main UI — two-tab interface
-│   │   ├── api.ts        # HTTP client for backend
-│   │   └── types.ts      # TypeScript interfaces
-│   ├── .env.example
-│   └── package.json
-└── server/               # FastAPI backend (port 8000)
+├── client/                 # React CG Workflow + query UI
+│   └── src/
+│       ├── App.tsx
+│       ├── api.ts
+│       └── types.ts
+├── scripts/
+│   ├── mock_trigger.py     # Interactive local email-event simulator
+│   └── imap_trigger.py     # Optional IMAP source adapter
+└── server/
     ├── app/
-    │   ├── main.py       # App init, CORS, route registration
-    │   ├── agents/       # Extract, Validate, Route, Query agents
-    │   ├── graph/        # LangGraph workflow orchestration
-    │   ├── api/v1/       # REST endpoints
-    │   ├── db/           # asyncpg pool & DB helpers
-    │   └── core/         # Config, logging, auth
-    ├── .env.example
+    │   ├── agents/         # Extractor, validator, router, query agent
+    │   ├── api/v1/         # Webhook, status, queue, resume endpoints
+    │   ├── core/           # Config, auth, state, logging
+    │   ├── db/             # PostgreSQL persistence
+    │   └── graph/          # LangGraph workflow
     └── requirements.txt
 ```
 
@@ -86,186 +60,241 @@ GoComet_Assignment/
 
 ## Setup
 
-### 1. Clone the repository
+### Backend
 
 ```bash
-git clone <repository-url>
-cd GoComet_Assignment
+cd server
+python3 -m venv gocometvenv
+source gocometvenv/bin/activate
+pip install -r requirements.txt
+cp .env.example .env
 ```
 
-### 2. Database setup
+Fill `server/.env`:
 
-Start PostgreSQL and create the database:
+```env
+OPENAI_API_KEY=sk-...
+MISTRAL_API_KEY=...
+DATABASE_URL=postgresql+asyncpg://postgres:password@localhost:5432/Nova
+API_KEY=1234567890
+```
+
+Create the database if needed:
 
 ```bash
 psql -U postgres -c "CREATE DATABASE Nova;"
 ```
 
-> The `graph_threads` table is created automatically when the server starts. No manual migrations needed.
-
-### 3. Backend setup
-
-```bash
-cd server
-
-# Create and activate a virtual environment
-python3 -m venv gocometvenv
-source gocometvenv/bin/activate        # macOS/Linux
-# gocometvenv\Scripts\activate.bat    # Windows
-
-# Install dependencies
-pip install -r requirements.txt
-
-# Configure environment variables
-cp .env.example .env
-# Edit .env and fill in all values (see Environment Variables section below)
-```
-
-### 4. Frontend setup
-
-```bash
-cd client
-
-# Install dependencies
-npm install
-
-# Configure environment variables
-cp .env.example .env
-# Edit .env and fill in all values (see Environment Variables section below)
-```
-
----
-
-## Running the App
-
-Open two terminals and run each service:
-
-**Terminal 1 — Backend**
+Run the API:
 
 ```bash
 cd server
 source gocometvenv/bin/activate
 uvicorn app.main:app --reload
-# Server runs at http://localhost:8000
-# Swagger docs at http://localhost:8000/docs
 ```
 
-**Terminal 2 — Frontend**
+Backend runs at `http://localhost:8000`; Swagger is at `http://localhost:8000/docs`.
+
+### Frontend
+
+```bash
+cd client
+npm install
+cp .env.example .env
+```
+
+Fill `client/.env`:
+
+```env
+VITE_API_BASE_URL=http://localhost:8000
+VITE_API_KEY=1234567890
+```
+
+Run the UI:
 
 ```bash
 cd client
 npm run dev
-# App runs at http://localhost:3000
 ```
 
-Open [http://localhost:3000](http://localhost:3000) in your browser.
-
-### Production build (frontend)
-
-```bash
-cd client
-npm run build      # outputs to client/dist/
-npm run preview    # serves the build locally for verification
-```
+Open `http://localhost:3000`.
 
 ---
 
-## Environment Variables
+## Running The Part 2 Demo
 
-### Server — `server/.env`
+### Option 1 — Mock Email Trigger
 
-Copy `server/.env.example` to `server/.env` and fill in:
+Use this for the assignment demo. It simulates one SU email with any number of selected attachments.
 
-```env
-OPENAI_API_KEY=sk-...          # OpenAI key with GPT-4o-mini access
-MISTRAL_API_KEY=...            # Mistral key for OCR
-DATABASE_URL=postgresql+asyncpg://postgres:password@localhost:5432/Nova
-API_KEY=your_secret_api_key    # Any string — used to authenticate all requests
+```bash
+cd /home/poison/Downloads/GoComet_Assignment
+API_KEY=1234567890 python3 scripts/mock_trigger.py
 ```
 
-| Variable | Description |
-|---|---|
-| `OPENAI_API_KEY` | Used by Extractor, Validator, Router, and Query agents |
-| `MISTRAL_API_KEY` | Used for document OCR via Mistral |
-| `DATABASE_URL` | asyncpg-compatible PostgreSQL connection string |
-| `API_KEY` | Shared secret sent as the `x-api-key` header |
+The script lists supported local files and lets you choose numbers like:
 
-### Client — `client/.env`
-
-Copy `client/.env.example` to `client/.env` and fill in:
-
-```env
-VITE_API_KEY=your_secret_api_key   # Must match server's API_KEY
-VITE_API_BASE_URL=http://localhost:8000
+```text
+1,3
 ```
 
-| Variable | Description |
-|---|---|
-| `VITE_API_KEY` | Must be the same value as the server's `API_KEY` |
-| `VITE_API_BASE_URL` | Base URL of the FastAPI server |
+or:
+
+```text
+1-3
+```
+
+You can also pass files directly:
+
+```bash
+API_KEY=1234567890 python3 scripts/mock_trigger.py Bill_of_lading.pdf commercial-invoice.png
+```
+
+### Option 2 — API-Only Multipart Upload
+
+This is not exposed in the frontend, but remains useful for testing. Upload multiple documents as one shipment:
+
+```bash
+curl -X POST http://127.0.0.1:8000/api/v1/pipeline/process \
+  -H "x-api-key: 1234567890" \
+  -F "files=@/path/to/Bill_of_lading.pdf" \
+  -F "files=@/path/to/commercial-invoice.png" \
+  -F "files=@/path/to/packing-list.pdf"
+```
+
+### Option 3 — Optional IMAP Adapter
+
+Add IMAP settings to `server/.env`:
+
+```env
+IMAP_HOST=imap.gmail.com
+IMAP_PORT=993
+IMAP_USERNAME=your_email@example.com
+IMAP_PASSWORD=your_app_password
+IMAP_FOLDER=INBOX
+IMAP_SEARCH_CRITERIA=UNSEEN
+```
+
+Then run:
+
+```bash
+python3 scripts/imap_trigger.py
+```
+
+To mark processed messages as seen:
+
+```bash
+python3 scripts/imap_trigger.py --mark-seen
+```
+
+The IMAP adapter is intentionally separate from the pipeline. It preprocesses mailbox emails into the same stable webhook contract used by the mock trigger.
+
+---
+
+## CG Workflow UI
+
+The React app has two tabs:
+
+- **CG Workflow** — live queue, verification results, discrepancy detail, editable draft reply, approve & mock-send.
+- **Query Data** — natural-language questions over stored pipeline state.
+
+The CG screen covers the required four states:
+
+- **Incoming** — a new SU email appears in the queue while the agent processes attachments.
+- **Verification result** — field-by-field view of matches, mismatches, uncertainties, and confidence scores.
+- **Discrepancy detail** — clicking a row shows found value, expected value, document name, and source snippet.
+- **Draft reply** — editable email to SU. The agent never sends automatically; CG must approve.
+
+Live updates only change the queue. If the operator is reading a selected review, the detail pane is not replaced automatically. A **Load update** banner appears when new results are available for that thread.
 
 ---
 
 ## API Reference
 
-All endpoints require an `x-api-key` header set to the value of `API_KEY`.
+All non-stream endpoints require `x-api-key: <API_KEY>`.
 
 | Method | Endpoint | Description |
 |---|---|---|
-| `GET` | `/health` | Health check |
-| `POST` | `/api/v1/pipeline/process` | Upload a document (multipart/form-data). Returns `{ job_id }` immediately. |
-| `GET` | `/api/v1/pipeline/status/{job_id}` | Poll for processing results. Returns full pipeline output when complete. |
-| `POST` | `/api/v1/query` | Run a natural language query over processed data. |
+| `GET` | `/health` | Service health check |
+| `POST` | `/api/v1/webhook/incoming-email` | Stable email event contract: sender, subject, attachment paths |
+| `POST` | `/api/v1/pipeline/process` | API-only multipart upload with `files=@...`, supports multiple docs |
+| `GET` | `/api/v1/pipeline/review-queue` | Incoming, failed, and pending CG workflow threads |
+| `GET` | `/api/v1/pipeline/review-queue/stream?api_key=...` | SSE queue updates for the frontend |
+| `GET` | `/api/v1/pipeline/status/{thread_id}` | Full state for a pipeline thread |
+| `POST` | `/api/v1/pipeline/resume/{thread_id}` | Resume paused graph with edited email text |
+| `POST` | `/api/v1/query` | Natural-language query over stored state |
 
-Full interactive documentation is available at [http://localhost:8000/docs](http://localhost:8000/docs) once the server is running.
+Webhook payload:
 
-### Example: process a document
-
-```bash
-# Upload
-curl -X POST http://localhost:8000/api/v1/pipeline/process \
-  -H "x-api-key: your_secret_api_key" \
-  -F "file=@invoice.pdf"
-# → { "job_id": "abc123" }
-
-# Poll for result
-curl http://localhost:8000/api/v1/pipeline/status/abc123 \
-  -H "x-api-key: your_secret_api_key"
+```json
+{
+  "sender": "shipping.unit@example.com",
+  "subject": "Shipment documents for validation",
+  "attachment_paths": [
+    "/tmp/bol.pdf",
+    "/tmp/invoice.png"
+  ]
+}
 ```
 
-### Example: natural language query
+Resume payload:
 
-```bash
-curl -X POST http://localhost:8000/api/v1/query \
-  -H "x-api-key: your_secret_api_key" \
-  -H "Content-Type: application/json" \
-  -d '{"question": "Which documents had a gross weight above 500 kg?"}'
+```json
+{
+  "edited_email_text": "Subject: Amendment Request..."
+}
 ```
 
 ---
 
-## Features
+## Persistence
 
-### Document processing pipeline
+Pipeline state is stored in PostgreSQL table `graph_threads`.
 
-- Accepts PDF and image documents via file upload
-- Extracts 8 structured fields: `consignee_name`, `hs_code`, `port_of_loading`, `port_of_discharge`, `incoterms`, `description_of_goods`, `gross_weight`, `invoice_number`
-- Extracts line items: description, quantity, HS code, origin, incoterms, unit price, currency, net/gross weight
-- Each field includes a confidence score
-- Routing decisions: **Auto-approve**, **Flag for review**, or **Draft amendment email**
+Stored state includes:
 
-### Natural language querying
+- incoming email metadata
+- per-document extracted data
+- cross-document and customer-rule validation results
+- draft email
+- human review status
+- edited email text
+- mock send result
+- failure message, if any
 
-- Ask questions in plain English about processed documents
-- The query agent converts them to SQL and returns a human-readable answer
+LangGraph uses `MemorySaver` for the POC interrupt, with a DB fallback on resume so pending review threads can still complete after server restart.
 
-### Frontend UI
+---
 
-- **Process Document tab** — upload a file or look up a previous job by ID; view extracted fields, line items, validation results, and routing outcome
-- **Query Data tab** — type a question and get a plain-English answer
+## Useful Commands
 
-### Observability
+Backend checks:
 
-- Rotating log file at `server/logs/nova_pipeline.log` (10 MB per file, 5 backups)
-- DEBUG-level logging to file; INFO to console
-- All agent inputs/outputs are logged for inspection
+```bash
+cd server
+source gocometvenv/bin/activate
+python -m compileall app
+```
+
+Frontend build:
+
+```bash
+cd client
+npm run build
+```
+
+Run mock trigger:
+
+```bash
+cd /home/poison/Downloads/GoComet_Assignment
+API_KEY=1234567890 python3 scripts/mock_trigger.py
+```
+
+---
+
+## Notes
+
+- Real email sending is mocked by `send_email_node`.
+- The agent never sends without CG approval.
+- IMAP ingestion is an adapter, not part of the core pipeline contract.
+- If Mistral/OpenAI network calls fail, the thread is marked `failed` and the error is shown in the CG queue.
