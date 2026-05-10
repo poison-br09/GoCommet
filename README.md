@@ -1,4 +1,4 @@
-# GoComet Assignment — Nova Trade Document Workflow
+# Nova - Trade Document Workflow
 
 AI-assisted trade document validation for Cargo Group (CG) operators. Nova ingests Shipping Unit (SU) emails, processes all attached shipment documents, cross-validates them, drafts a reply, and waits for a human CG approval before any email is sent.
 
